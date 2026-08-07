@@ -1122,9 +1122,201 @@ This is gonna be great!`,
             if (attempt !== undefined) attempt.catch(() => {});
         }
 
+        /* =========================================================
+           ERAM TALK BLIPS — QUIETER + IOS-SAFER WEB AUDIO SYSTEM
+           =========================================================
+           Keeps ERAM's original sound file but plays it through Web Audio.
+           This avoids repeatedly restarting one <audio> element, softens
+           the harsh high end, lowers the level, and lets blips overlap.
+        */
+        const ERAM_BLIP_VOLUME = 0.10;
+        const ERAM_BLIP_CUTOFF_HZ = 5000;
+        const ERAM_BLIP_GAP_MS = window.matchMedia(
+            "(hover: none) and (pointer: coarse)"
+        ).matches ? 60 : 34;
+
+        const EramAudioContextClass =
+            window.AudioContext || window.webkitAudioContext;
+
+        let eramBlipContext = null;
+        let eramBlipBuffer = null;
+        let eramBlipLoadPromise = null;
+        let eramBlipMasterGain = null;
+        let eramBlipCompressor = null;
+        let lastEramBlipAt = 0;
+
+        function getEramBlipUrl() {
+            const sourceElement = eramTalkingSound.querySelector("source");
+
+            return (
+                eramTalkingSound.currentSrc ||
+                eramTalkingSound.src ||
+                (sourceElement ? sourceElement.src : "")
+            );
+        }
+
+        function buildEramBlipOutputChain() {
+            if (
+                !eramBlipContext ||
+                (eramBlipMasterGain && eramBlipCompressor)
+            ) {
+                return;
+            }
+
+            eramBlipCompressor =
+                eramBlipContext.createDynamicsCompressor();
+
+            eramBlipCompressor.threshold.value = -24;
+            eramBlipCompressor.knee.value = 18;
+            eramBlipCompressor.ratio.value = 5;
+            eramBlipCompressor.attack.value = 0.003;
+            eramBlipCompressor.release.value = 0.08;
+
+            eramBlipMasterGain =
+                eramBlipContext.createGain();
+
+            eramBlipMasterGain.gain.value =
+                ERAM_BLIP_VOLUME;
+
+            eramBlipCompressor
+                .connect(eramBlipMasterGain)
+                .connect(eramBlipContext.destination);
+        }
+
+        function prepareEramBlipAudio() {
+            if (!EramAudioContextClass) {
+                return Promise.resolve();
+            }
+
+            if (eramBlipLoadPromise) {
+                return eramBlipLoadPromise;
+            }
+
+            eramBlipLoadPromise = (async () => {
+                if (!eramBlipContext) {
+                    eramBlipContext =
+                        new EramAudioContextClass();
+                }
+
+                buildEramBlipOutputChain();
+
+                const url = getEramBlipUrl();
+
+                if (!url) {
+                    return;
+                }
+
+                const response = await fetch(url, {
+                    cache: "force-cache"
+                });
+
+                if (!response.ok) {
+                    throw new Error(
+                        `ERAM blip request failed: ${response.status}`
+                    );
+                }
+
+                const audioData =
+                    await response.arrayBuffer();
+
+                eramBlipBuffer =
+                    await eramBlipContext.decodeAudioData(audioData);
+            })().catch(error => {
+                console.warn(
+                    "ERAM Web Audio blip could not be prepared.",
+                    error
+                );
+
+                eramBlipLoadPromise = null;
+            });
+
+            return eramBlipLoadPromise;
+        }
+
+        async function unlockEramBlipAudio() {
+            await prepareEramBlipAudio();
+
+            if (
+                eramBlipContext &&
+                eramBlipContext.state === "suspended"
+            ) {
+                try {
+                    await eramBlipContext.resume();
+                } catch (error) {}
+            }
+        }
+
+        function playEramBlip(character) {
+            if (
+                character === " " ||
+                character === "\n" ||
+                character === "\t"
+            ) {
+                return;
+            }
+
+            if (!eramBlipContext || !eramBlipBuffer) {
+                prepareEramBlipAudio();
+                return;
+            }
+
+            if (eramBlipContext.state !== "running") {
+                return;
+            }
+
+            const now = performance.now();
+
+            if (now - lastEramBlipAt < ERAM_BLIP_GAP_MS) {
+                return;
+            }
+
+            lastEramBlipAt = now;
+
+            const source =
+                eramBlipContext.createBufferSource();
+
+            const filter =
+                eramBlipContext.createBiquadFilter();
+
+            source.buffer = eramBlipBuffer;
+
+            filter.type = "lowpass";
+            filter.frequency.value =
+                ERAM_BLIP_CUTOFF_HZ;
+            filter.Q.value = 0.25;
+
+            source
+                .connect(filter)
+                .connect(eramBlipCompressor);
+
+            source.start(0);
+        }
+
+        /* Decode early. Safari may keep the context suspended until
+           the first real interaction, then these listeners resume it. */
+        prepareEramBlipAudio();
+
+        window.addEventListener(
+            "pointerdown",
+            unlockEramBlipAudio,
+            { once: true, capture: true }
+        );
+
+        window.addEventListener(
+            "touchstart",
+            unlockEramBlipAudio,
+            { once: true, passive: true, capture: true }
+        );
+
+        window.addEventListener(
+            "keydown",
+            unlockEramBlipAudio,
+            { once: true, capture: true }
+        );
+
+
         function playEramBleep(character) {
-            if (character === " " || character === "\n") return;
-            safelyPlay(eramTalkingSound, 0.58);
+            playEramBlip(character);
         }
 
         function playEramFinishSound() {
@@ -1825,22 +2017,7 @@ if (
 
                 safelyPlay(selectSound, 0.85);
 
-                eramTalkingSound.volume = 0;
-
-                const unlockAttempt =
-                    eramTalkingSound.play();
-
-                if (unlockAttempt !== undefined) {
-                    unlockAttempt
-                        .then(() => {
-                            eramTalkingSound.pause();
-                            eramTalkingSound.currentTime = 0;
-                            eramTalkingSound.volume = 0.58;
-                        })
-                        .catch(() => {
-                            eramTalkingSound.volume = 0.58;
-                        });
-                }
+                unlockEramBlipAudio();
 
                 logoOpener.classList.add("hidden");
 
